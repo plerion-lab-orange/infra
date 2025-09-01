@@ -1,12 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Plerion Misconfig Lab (FINAL + old Lambda runtime) - Intentionally insecure resources for workshops:
+  Plerion Misconfig Lab (TEST v2) - Intentionally insecure resources for workshops:
   - Public RDS with both GOOD and BAD SGs attached (bad rule overrides good)
-  - API Gateway with mixed auth (one resource secured, one public)
+  - API Gateway with mixed auth (one secured by custom authorizer, one public)
   - Public S3 bucket (BPA disabled + public policy)
   - SQS queue open to the world
   - Lambda: outdated runtime (python3.9), public Function URL, admin perms, secrets in env
-  - IAM anti-patterns: wildcard-trust admin role; break-glass users with keys; *:* dev group
+  - IAM anti-patterns: internal escalation admin role; break-glass users with keys; *:* dev group
   - Publicly readable Secrets Manager secret
 
 Parameters:
@@ -16,8 +16,10 @@ Parameters:
     Description: Globally-unique S3 bucket name.
   DBMasterUsername:
     Type: String
-    Default: admin
-    Description: Default 'admin' to simulate bad practice.
+    Default: badlabuser
+    AllowedPattern: '^(?!admin$)(?!postgres$)[a-zA-Z][a-zA-Z0-9_]{0,62}$'
+    ConstraintDescription: "Username cannot be 'admin' or 'postgres'; 1–63 chars, start with a letter."
+    Description: Postgres master username (intentionally weak but valid).
   DBMasterPassword:
     Type: String
     NoEcho: true
@@ -111,7 +113,7 @@ Resources:
       RouteTableId: !Ref PublicRouteTable
 
   ########################################
-  # Over-permissive Security Group (kept for demos)
+  # Security Groups & RDS
   ########################################
   OverPermissiveSG:
     Type: AWS::EC2::SecurityGroup
@@ -128,9 +130,6 @@ Resources:
           Description: "Everything outbound (overbroad)"
       Tags: [{ Key: Name, Value: PlerionBadLabAllowAll }]
 
-  ########################################
-  # RDS (Public, bad config) + GOOD and BAD DB SGs applied together
-  ########################################
   AppTierSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -208,7 +207,7 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Ref PublicBucketName
-      AccessControl: PublicRead
+      # AccessControl: PublicRead   # removed to avoid Object Ownership conflict
       PublicAccessBlockConfiguration:
         BlockPublicAcls: false
         BlockPublicPolicy: false
@@ -291,8 +290,8 @@ Resources:
       Environment:
         Variables:
           STRIPE_SECRET_KEY: "sk_live_REDACTED"
-          AWS_ACCESS_KEY_ID: "AKIAFAKEEXPOSED"
-          AWS_SECRET_ACCESS_KEY: "very-bad-to-store-here"
+          LEAKED_AWS_ACCESS_KEY_ID: "AKIAFAKEEXPOSED"              # renamed (not reserved)
+          LEAKED_AWS_SECRET_ACCESS_KEY: "very-bad-to-store-here"   # renamed (not reserved)
       Code:
         ZipFile: |
           import os, json
@@ -313,7 +312,7 @@ Resources:
       AuthType: NONE
       Cors:
         AllowOrigins: ["*"]
-        AllowMethods: ["GET","POST","OPTIONS"]
+        AllowMethods: ["GET","POST"]   # Lambda URLs auto-handle OPTIONS
         AllowHeaders: ["*"]
 
   BadLambdaUrlPermission:
@@ -327,24 +326,6 @@ Resources:
   ########################################
   # API Gateway (one method uses authorizer, another is open)
   ########################################
-  ApiRoleForInvoke:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: apigateway.amazonaws.com }
-            Action: "sts:AssumeRole"
-      Policies:
-        - PolicyName: InvokeLambda
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt BadLambda.Arn
-
   ApiGatewayRest:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -410,22 +391,25 @@ Resources:
                   }
               }
 
+  # Permission for API Gateway to invoke the authorizer function
   AuthorizerPermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref AuthorizerFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRest}/authorizers/*
 
   TokenAuthorizer:
     Type: AWS::ApiGateway::Authorizer
+    DependsOn: AuthorizerPermission
     Properties:
-      Name: BadLabTokenAuthorizer
+      Name: !Sub "BadLabTokenAuthorizer-${AWS::StackName}"
       RestApiId: !Ref ApiGatewayRest
       Type: TOKEN
-      AuthorizerUri: !Sub >
-        arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations
       IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: 0
 
   PublicGetMethod:
     Type: AWS::ApiGateway::Method
@@ -435,12 +419,9 @@ Resources:
       HttpMethod: GET
       AuthorizationType: NONE
       Integration:
-        Type: AWS
-        Credentials: !GetAtt ApiRoleForInvoke.Arn
+        Type: AWS_PROXY
         IntegrationHttpMethod: POST
-        Uri: !Sub >
-          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BadLambda.Arn}/invocations
-        PassthroughBehavior: WHEN_NO_MATCH
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BadLambda.Arn}/invocations
       MethodResponses:
         - StatusCode: 200
 
@@ -453,12 +434,9 @@ Resources:
       AuthorizationType: CUSTOM
       AuthorizerId: !Ref TokenAuthorizer
       Integration:
-        Type: AWS
-        Credentials: !GetAtt ApiRoleForInvoke.Arn
+        Type: AWS_PROXY
         IntegrationHttpMethod: POST
-        Uri: !Sub >
-          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BadLambda.Arn}/invocations
-        PassthroughBehavior: WHEN_NO_MATCH
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BadLambda.Arn}/invocations
       MethodResponses:
         - StatusCode: 200
 
@@ -480,16 +458,17 @@ Resources:
   ########################################
   # IAM Anti-Patterns
   ########################################
-  OpenTrustAdminRole:
+  EscalationAdminRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: PlerionBadLabOpenTrustAdminRole
+      RoleName: PlerionBadLabEscalationAdminRole
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: "*"
-            Action: "sts:AssumeRole"
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AdministratorAccess
 
@@ -552,57 +531,58 @@ Resources:
             Effect: Allow
             Principal: "*"
             Action: "secretsmanager:GetSecretValue"
-            Resource: !GetAtt BadSecret.Arn
+            Resource: !Ref BadSecret   # Ref returns ARN
 
 Outputs:
   PublicBucketNameOut:
     Value: !Ref PublicBucketName
-    Description: Public S3 bucket (BPA disabled + public policy)
+    Description: "Public S3 bucket (BPA disabled + public policy)."
 
   RDSAddress:
     Value: !GetAtt BadLabRDS.Endpoint.Address
-    Description: Public RDS endpoint (Postgres) — effective access is PUBLIC due to BAD SG.
+    Description: "Public RDS endpoint (Postgres) — effective access is PUBLIC due to BAD SG."
 
   DBGoodSGId:
     Value: !Ref DBGoodSG
-    Description: GOOD DB SG (5432 from AppTierSG only)
+    Description: "GOOD DB SG (5432 from AppTierSG only)."
 
   DBBadSGId:
     Value: !Ref DBBadSG
-    Description: BAD DB SG (5432 from 0.0.0.0/0)
+    Description: "BAD DB SG (5432 from 0.0.0.0/0)."
 
   BadLambdaRuntime:
     Value: !Ref LambdaRuntime
-    Description: Lambda runtime in use (defaults to older python3.9)
+    Description: "Lambda runtime in use (defaults to older python3.9)."
 
   BadLambdaFunctionUrl:
     Value: !GetAtt BadLambdaUrl.FunctionUrl
-    Description: Public Lambda Function URL (no auth)
+    Description: "Public Lambda Function URL (no auth)."
 
   ApiInvokePublic:
     Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/public"
-    Description: Open API endpoint (no authorizer)
+    Description: "Open API endpoint (no authorizer)."
 
   ApiInvokeSecure:
     Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/secure"
-    Description: API endpoint protected by custom authorizer (send Authorization: allow)
+    Description: "API endpoint protected by custom authorizer (send header 'Authorization: allow')."
 
   BreakGlassAccessKeyId:
     Value: !Ref BreakGlassAccessKey
-    Description: Break-glass admin user AccessKeyId
+    Description: "Break-glass admin user AccessKeyId."
 
   BreakGlassSecretAccessKey:
     Value: !GetAtt BreakGlassAccessKey.SecretAccessKey
-    Description: Break-glass admin user SecretAccessKey (intentionally exposed)
+    Description: "Break-glass admin user SecretAccessKey (intentionally exposed)."
 
   DevUserAccessKeyId:
     Value: !Ref DevUserKey
-    Description: Dev user AccessKeyId (*:* perms)
+    Description: "Dev user AccessKeyId (*:* perms)."
 
   DevUserSecretAccessKey:
     Value: !GetAtt DevUserKey.SecretAccessKey
-    Description: Dev user SecretAccessKey
+    Description: "Dev user SecretAccessKey."
 
-  OpenTrustAdminRoleArn:
-    Value: !GetAtt OpenTrustAdminRole.Arn
-    Description: Wildcard-trust admin role ARN
+  EscalationAdminRoleArn:
+    Value: !GetAtt EscalationAdminRole.Arn
+    Description: "Internal admin role trust = account root (dev-user can assume)."
+

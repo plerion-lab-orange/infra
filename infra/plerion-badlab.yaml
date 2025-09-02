@@ -9,52 +9,54 @@ Description: >
   - IAM anti-patterns: internal escalation admin role; break-glass users with keys; *:* dev group
   - Publicly readable Secrets Manager secret
   - Vulnerable packages provided via Lambda Layer (built from lock file)
+  - Function ZIP now includes a vulnerable requirements.txt (uploaded to S3 by CI)
 
 Parameters:
   PublicBucketName:
     Type: String
     Description: Globally-unique S3 bucket name.
+
   DBMasterUsername:
     Type: String
     Default: badlabuser
     AllowedPattern: '^(?!admin$)(?!postgres$)[a-zA-Z][a-zA-Z0-9_]{0,62}$'
     ConstraintDescription: "Username cannot be 'admin' or 'postgres'; 1–63 chars, start with a letter."
+
   DBMasterPassword:
     Type: String
     NoEcho: true
     Default: Pl3rionBadLab123!
     Description: Plaintext DB password to simulate hardcoding.
+
   LambdaRuntime:
     Type: String
     Default: python3.9
     AllowedValues: [python3.9, python3.10, python3.11, python3.12]
     Description: Older runtime by default (swap to 3.10/3.11 if 3.9 creation is blocked in your region).
+
   ApiStageName:
     Type: String
     Default: prod
+
   ArtifactBucket:
     Type: String
     Description: S3 bucket that holds Lambda code/layer zips.
 
-  # (Kept for compatibility if referenced elsewhere, but not used by the layer anymore)
   VulnLayerKey:
     Type: String
     Default: layers/vuln-py39-layer.zip
     Description: S3 key for the vulnerable Python layer zip.
 
-  # New inputs the workflow passes so we don't rely on any pseudo-timestamps
-  LayerS3Key:
+  # NEW: function ZIP published by CI to the same ArtifactBucket
+  LambdaZipKey:
     Type: String
-    Default: layers/vuln-py39-layer.zip
-    Description: S3 key for the uploaded layer zip (from CI).
-  LayerObjectVersion:
-    Type: String
-    Default: ""
-    Description: Optional S3 VersionId for the layer object (if your artifact bucket is versioned).
-  LayerContentHash:
+    Default: lambda/hello.zip
+    Description: S3 key for the function ZIP (built by CI and uploaded to the artifact bucket).
+
+  LambdaZipVersionId:
     Type: String
     Default: ""
-    Description: Optional content hash (e.g., ETag) to annotate the layer description and force updates.
+    Description: Optional S3 VersionId for the function ZIP (forces update each deploy if provided).
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -62,16 +64,13 @@ Metadata:
       - Label: { default: "General" }
         Parameters: [ApiStageName]
       - Label: { default: "S3" }
-        Parameters: [PublicBucketName, ArtifactBucket, LayerS3Key, LayerObjectVersion, LayerContentHash]
+        Parameters: [PublicBucketName, ArtifactBucket]
       - Label: { default: "RDS" }
         Parameters: [DBMasterUsername, DBMasterPassword]
       - Label: { default: "Lambda" }
-        Parameters: [LambdaRuntime]
+        Parameters: [LambdaRuntime, VulnLayerKey, LambdaZipKey, LambdaZipVersionId]
     ParameterLabels:
       PublicBucketName: { default: "Public S3 bucket name (must be unique)" }
-
-Conditions:
-  HasLayerObjectVersion: !Not [ !Equals [ !Ref LayerObjectVersion, "" ] ]
 
 Resources:
 
@@ -278,7 +277,7 @@ Resources:
 
   ########################################
   # Lambda: OLD runtime, admin perms, secrets in env,
-  # public URL + vuln layer
+  # public URL + vuln layer + vulnerable function ZIP
   ########################################
   LambdaAdminRole:
     Type: AWS::IAM::Role
@@ -308,12 +307,11 @@ Resources:
     Type: AWS::Lambda::LayerVersion
     Properties:
       LayerName: plerion-badlab-vuln-py39
-      Description: !Sub "Intentionally vulnerable Python packages (hash=${LayerContentHash})"
       Content:
         S3Bucket: !Ref ArtifactBucket
-        S3Key: !Ref LayerS3Key
-        S3ObjectVersion: !If [ HasLayerObjectVersion, !Ref LayerObjectVersion, !Ref AWS::NoValue ]
+        S3Key: !Ref VulnLayerKey
       CompatibleRuntimes: [python3.9]
+      Description: "Intentionally vulnerable Python packages (FOR LAB ONLY)"
 
   BadLambda:
     Type: AWS::Lambda::Function
@@ -326,23 +324,22 @@ Resources:
       Layers: [!Ref VulnPy39Layer]
       Environment:
         Variables:
-          STRIPE_SECRET_KEY: "sk_live_REDACTED"
-          LEAKED_AWS_ACCESS_KEY_ID: "AKIAFAKEEXPOSED"
-          LEAKED_AWS_SECRET_ACCESS_KEY: "very-bad-to-store-here"
+          # Keep hard-coded 'fake' secrets so scanners/demos can see them
+          STRIPE_SECRET_KEY: "sk_live_51HkWEXAMPLEgk5xY8yQ05m"
+          LEAKED_AWS_ACCESS_KEY_ID: "AKIAA1B2C3D4E5F6G7H8"
+          LEAKED_AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
       Code:
-        ZipFile: |
-          import os, json
-          import yaml, jinja2, requests, urllib3  # from the vuln layer
-          def handler(event, context):
-              print("Vuln lib versions", {
-                  "PyYAML": getattr(yaml, "__version__", None),
-                  "Jinja2": getattr(jinja2, "__version__", None),
-                  "requests": getattr(requests, "__version__", None),
-                  "urllib3": getattr(urllib3, "__version__", None),
-              })
-              print("EnvLeakExample", {k: v for k, v in os.environ.items()
-                     if k.startswith(("LEAKED_", "STRIPE_"))})
-              return {"statusCode": 200, "body": json.dumps({"ok": True})}
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LambdaZipKey
+        # Optional; CFN ignores empty string if bucket has no versioning
+        S3ObjectVersion: !If
+          - HasZipVersion
+          - !Ref LambdaZipVersionId
+          - !Ref "AWS::NoValue"
+
+  # Condition so we can pass empty LambdaZipVersionId safely
+  HasZipVersionCondition:
+    Type: "AWS::NoValue" # placeholder (not a resource), see Conditions below
 
   BadLambdaLogGroup:
     Type: AWS::Logs::LogGroup
@@ -553,3 +550,82 @@ Resources:
     Type: AWS::IAM::AccessKey
     Properties:
       UserName: !Ref DevUser
+
+  ########################################
+  # Secrets Manager - publicly readable secret
+  ########################################
+  BadSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: plerion/badlab/public-secret
+      Description: "Intentionally misconfigured: public-readable secret"
+      SecretString: '{"SuperSecretProdKey":"shh-12345"}'
+
+  BadSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref BadSecret
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAnyoneReadSecret
+            Effect: Allow
+            Principal: "*"
+            Action: "secretsmanager:GetSecretValue"
+            Resource: !Ref BadSecret
+
+Conditions:
+  HasZipVersion: !Not [ !Equals [ !Ref LambdaZipVersionId, "" ] ]
+
+Outputs:
+  PublicBucketNameOut:
+    Value: !Ref PublicBucketName
+    Description: "Public S3 bucket (BPA disabled + public policy)."
+
+  RDSAddress:
+    Value: !GetAtt BadLabRDS.Endpoint.Address
+    Description: "Public RDS endpoint (Postgres) — effective access is PUBLIC due to BAD SG."
+
+  DBGoodSGId:
+    Value: !Ref DBGoodSG
+    Description: "GOOD DB SG (5432 from AppTierSG only)."
+
+  DBBadSGId:
+    Value: !Ref DBBadSG
+    Description: "BAD DB SG (5432 from 0.0.0.0/0)."
+
+  BadLambdaRuntime:
+    Value: !Ref LambdaRuntime
+    Description: "Lambda runtime in use (defaults to older python3.9)."
+
+  BadLambdaFunctionUrl:
+    Value: !GetAtt BadLambdaUrl.FunctionUrl
+    Description: "Public Lambda Function URL (no auth)."
+
+  ApiInvokePublic:
+    Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/public"
+    Description: "Open API endpoint (no authorizer)."
+
+  ApiInvokeSecure:
+    Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/secure"
+    Description: "API endpoint protected by custom authorizer (send header 'Authorization: allow')."
+
+  BreakGlassAccessKeyId:
+    Value: !Ref BreakGlassAccessKey
+    Description: "Break-glass admin user AccessKeyId."
+
+  BreakGlassSecretAccessKey:
+    Value: !GetAtt BreakGlassAccessKey.SecretAccessKey
+    Description: "Break-glass admin user SecretAccessKey (intentionally exposed)."
+
+  DevUserAccessKeyId:
+    Value: !Ref DevUserKey
+    Description: "Dev user AccessKeyId (*:* perms)."
+
+  DevUserSecretAccessKey:
+    Value: !GetAtt DevUserKey.SecretAccessKey
+    Description: "Dev user SecretAccessKey."
+
+  EscalationAdminRoleArn:
+    Value: !GetAtt EscalationAdminRole.Arn
+    Description: "Internal admin role trust = account root (dev-user can assume)."

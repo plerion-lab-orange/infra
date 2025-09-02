@@ -1,0 +1,5 @@
+# Intentionally vulnerable; FOR LAB USE ONLY
+PyYAML==5.3
+Jinja2==2.10.1
+urllib3==1.25.9
+requests==2.22.0

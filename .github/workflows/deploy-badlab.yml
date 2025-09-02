@@ -1,4 +1,5 @@
 name: Build & Deploy BadLab
+
 on:
   push:
     branches: [ main ]
@@ -31,14 +32,46 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Show repo tree
+        run: |
+          pwd
+          ls -la
+          ls -la infra
+          ls -la layers/vuln-py39
+
       - name: Build vulnerable layer
         run: |
           bash layers/vuln-py39/build.sh
 
-      - name: Upload layer to S3
+      # Upload via s3api so we get ETag (content hash) and VersionId (if bucket versioning on)
+      - name: Upload layer to S3 (capture ETag & VersionId)
+        id: put
+        shell: bash
         run: |
-          aws s3 cp layers/vuln-py39/build/vuln-py39-layer.zip \
-            s3://${{ env.ARTIFACT_BUCKET }}/layers/vuln-py39-layer.zip
+          RESP=$(aws s3api put-object \
+            --bucket "${{ env.ARTIFACT_BUCKET }}" \
+            --key "layers/vuln-py39-layer.zip" \
+            --body "layers/vuln-py39/build/vuln-py39-layer.zip")
+
+          ETAG=$(echo "$RESP" | jq -r '.ETag' | tr -d '"')
+          VERSION=$(echo "$RESP" | jq -r '.VersionId // empty')
+
+          echo "etag=$ETAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Uploaded layer with ETag=$ETAG VersionId=${VERSION:-none}"
+
+      # Generate realistic-looking leaked keys for Lambda env
+      - name: Generate fake leaked secrets
+        id: gen
+        shell: bash
+        run: |
+          AKI="AKIA$(tr -dc 'A-Z0-9' </dev/urandom | head -c 16)"
+          SEC="$(tr -dc 'A-Za-z0-9/+=' </dev/urandom | head -c 40)"
+          STRIPE="sk_live_$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
+          echo "aki=$AKI" >> "$GITHUB_OUTPUT"
+          echo "sec=$SEC" >> "$GITHUB_OUTPUT"
+          echo "stripe=$STRIPE" >> "$GITHUB_OUTPUT"
+          echo "Generated AKI=$AKI STRIPE=$STRIPE"
 
       - name: Deploy CloudFormation
         run: |
@@ -50,4 +83,11 @@ jobs:
             --parameter-overrides \
               ArtifactBucket=${{ env.ARTIFACT_BUCKET }} \
               VulnLayerKey=layers/vuln-py39-layer.zip \
-              PublicBucketName=${{ env.PUBLIC_BUCKET_NAME }}
+              PublicBucketName=${{ env.PUBLIC_BUCKET_NAME }} \
+              # new/changed bits:
+              LayerS3Key=layers/vuln-py39-layer.zip \
+              LayerContentHash=${{ steps.put.outputs.etag }} \
+              LayerObjectVersion=${{ steps.put.outputs.version }} \
+              LeakedAwsAccessKeyId=${{ steps.gen.outputs.aki }} \
+              LeakedAwsSecretAccessKey=${{ steps.gen.outputs.sec }} \
+              StripeLiveSecret=${{ steps.gen.outputs.stripe }}

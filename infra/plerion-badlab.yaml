@@ -1,82 +1,45 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Plerion Misconfig Lab (Auto CI) - Intentionally insecure resources for workshops:
-  - Public RDS with both GOOD and BAD SGs attached (bad rule overrides good)
-  - API Gateway with mixed auth (one secured by custom authorizer, one public)
-  - Public S3 bucket (BPA disabled + public policy)
+  Plerion Misconfig Lab (Auto CI) - Insecure demo:
+  - Public RDS with both GOOD and BAD SGs
+  - API Gateway (one public, one custom authorizer)
+  - Public S3 bucket
   - SQS queue open to the world
-  - Lambda: outdated runtime (python3.9), public Function URL, admin perms, secrets in env
-  - IAM anti-patterns: internal escalation admin role; break-glass users with keys; *:* dev group
+  - Lambda (older runtime), public Function URL, admin perms, secrets in code/env
+  - IAM anti-patterns
   - Publicly readable Secrets Manager secret
-  - Vulnerable packages provided via Lambda Layer (built from lock file)
-  - Function ZIP now includes a vulnerable requirements.txt (uploaded to S3 by CI)
+  - Vulnerable packages via Lambda Layer (built from lock file)
 
 Parameters:
   PublicBucketName:
     Type: String
     Description: Globally-unique S3 bucket name.
-
   DBMasterUsername:
     Type: String
     Default: badlabuser
     AllowedPattern: '^(?!admin$)(?!postgres$)[a-zA-Z][a-zA-Z0-9_]{0,62}$'
-    ConstraintDescription: "Username cannot be 'admin' or 'postgres'; 1–63 chars, start with a letter."
-
   DBMasterPassword:
     Type: String
     NoEcho: true
     Default: Pl3rionBadLab123!
-    Description: Plaintext DB password to simulate hardcoding.
-
   LambdaRuntime:
     Type: String
     Default: python3.9
     AllowedValues: [python3.9, python3.10, python3.11, python3.12]
-    Description: Older runtime by default (swap to 3.10/3.11 if 3.9 creation is blocked in your region).
-
   ApiStageName:
     Type: String
     Default: prod
-
   ArtifactBucket:
     Type: String
-    Description: S3 bucket that holds Lambda code/layer zips.
-
+    Description: S3 bucket holding the Lambda layer zip.
   VulnLayerKey:
     Type: String
     Default: layers/vuln-py39-layer.zip
     Description: S3 key for the vulnerable Python layer zip.
 
-  # NEW: function ZIP published by CI to the same ArtifactBucket
-  LambdaZipKey:
-    Type: String
-    Default: lambda/hello.zip
-    Description: S3 key for the function ZIP (built by CI and uploaded to the artifact bucket).
-
-  LambdaZipVersionId:
-    Type: String
-    Default: ""
-    Description: Optional S3 VersionId for the function ZIP (forces update each deploy if provided).
-
-Metadata:
-  AWS::CloudFormation::Interface:
-    ParameterGroups:
-      - Label: { default: "General" }
-        Parameters: [ApiStageName]
-      - Label: { default: "S3" }
-        Parameters: [PublicBucketName, ArtifactBucket]
-      - Label: { default: "RDS" }
-        Parameters: [DBMasterUsername, DBMasterPassword]
-      - Label: { default: "Lambda" }
-        Parameters: [LambdaRuntime, VulnLayerKey, LambdaZipKey, LambdaZipVersionId]
-    ParameterLabels:
-      PublicBucketName: { default: "Public S3 bucket name (must be unique)" }
-
 Resources:
 
-  ########################################
-  # Networking (simple public VPC)
-  ########################################
+  # ---------------- VPC & Networking ----------------
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -136,9 +99,7 @@ Resources:
       SubnetId: !Ref PublicSubnetB
       RouteTableId: !Ref PublicRouteTable
 
-  ########################################
-  # Security Groups & RDS
-  ########################################
+  # ---------------- Security Groups & RDS ----------------
   OverPermissiveSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -147,17 +108,15 @@ Resources:
       SecurityGroupIngress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
-          Description: "Everything inbound (bad)"
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
-          Description: "Everything outbound (overbroad)"
       Tags: [{ Key: Name, Value: PlerionBadLabAllowAll }]
 
   AppTierSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: "App tier SG (simulated producer)"
+      GroupDescription: "App tier SG"
       VpcId: !Ref VPC
       SecurityGroupIngress: []
       SecurityGroupEgress:
@@ -167,14 +126,13 @@ Resources:
   DBGoodSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: "GOOD: Only allow Postgres from AppTierSG"
+      GroupDescription: "GOOD: Only Postgres from AppTierSG"
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
           SourceSecurityGroupId: !Ref AppTierSG
-          Description: "Postgres from App tier only"
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -189,7 +147,6 @@ Resources:
           FromPort: 5432
           ToPort: 5432
           CidrIp: 0.0.0.0/0
-          Description: "Public Postgres (bad)"
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -213,20 +170,15 @@ Resources:
       MasterUserPassword: !Ref DBMasterPassword
       AllocatedStorage: 20
       DBInstanceClass: db.t3.micro
-      VPCSecurityGroups:
-        - !Ref DBGoodSG
-        - !Ref DBBadSG
+      VPCSecurityGroups: [!Ref DBGoodSG, !Ref DBBadSG]
       DBSubnetGroupName: !Ref DBSubnetGroup
       BackupRetentionPeriod: 0
       AutoMinorVersionUpgrade: false
       StorageEncrypted: false
       MultiAZ: false
       DeletionProtection: false
-      EnableCloudwatchLogsExports: []
 
-  ########################################
-  # S3 - Public bucket (BPA disabled + public bucket policy)
-  ########################################
+  # ---------------- S3 (public) ----------------
   PublicBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -238,8 +190,7 @@ Resources:
         RestrictPublicBuckets: false
       WebsiteConfiguration:
         IndexDocument: index.html
-      Tags:
-        - { Key: Purpose, Value: "BadLabPublic" }
+      Tags: [{ Key: Purpose, Value: BadLabPublic }]
 
   PublicBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -254,9 +205,7 @@ Resources:
             Action: "s3:GetObject"
             Resource: !Sub "${PublicBucket.Arn}/*"
 
-  ########################################
-  # SQS - Open to the world
-  ########################################
+  # ---------------- SQS (open) ----------------
   OpenQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -275,10 +224,7 @@ Resources:
             Action: "sqs:*"
             Resource: !GetAtt OpenQueue.Arn
 
-  ########################################
-  # Lambda: OLD runtime, admin perms, secrets in env,
-  # public URL + vuln layer + vulnerable function ZIP
-  ########################################
+  # ---------------- Lambda + Layer ----------------
   LambdaAdminRole:
     Type: AWS::IAM::Role
     Properties:
@@ -292,15 +238,12 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AdministratorAccess
       Policies:
-        - PolicyName: BasicLogs
+        - PolicyName: Logs
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
                 Resource: "*"
 
   VulnPy39Layer:
@@ -324,22 +267,39 @@ Resources:
       Layers: [!Ref VulnPy39Layer]
       Environment:
         Variables:
-          # Keep hard-coded 'fake' secrets so scanners/demos can see them
-          STRIPE_SECRET_KEY: "sk_live_51HkWEXAMPLEgk5xY8yQ05m"
-          LEAKED_AWS_ACCESS_KEY_ID: "AKIAA1B2C3D4E5F6G7H8"
+          STRIPE_SECRET_KEY: "sk_live_9r2yYFJk0xQv6D1a7cW8eM5n3pB4tH2L"
+          LEAKED_AWS_ACCESS_KEY_ID: "AKIA1234567890ABCD"
           LEAKED_AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
       Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Ref LambdaZipKey
-        # Optional; CFN ignores empty string if bucket has no versioning
-        S3ObjectVersion: !If
-          - HasZipVersion
-          - !Ref LambdaZipVersionId
-          - !Ref "AWS::NoValue"
+        ZipFile: |
+          import os, json
+          import yaml, jinja2, requests, urllib3
 
-  # Condition so we can pass empty LambdaZipVersionId safely
-  HasZipVersionCondition:
-    Type: "AWS::NoValue" # placeholder (not a resource), see Conditions below
+          # "secrets" also present in code (for code/content scanners)
+          STRIPE_SECRET_KEY = "sk_live_9r2yYFJk0xQv6D1a7cW8eM5n3pB4tH2L"
+          LEAKED_AWS_ACCESS_KEY_ID = "AKIA1234567890ABCD"
+          LEAKED_AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+          def handler(event, context):
+              print("Vuln lib versions", {
+                  "PyYAML": getattr(yaml, "__version__", None),
+                  "Jinja2": getattr(jinja2, "__version__", None),
+                  "requests": getattr(requests, "__version__", None),
+                  "urllib3": getattr(urllib3, "__version__", None),
+              })
+              # leak env
+              leaked = {k: v for k, v in os.environ.items() if k.startswith(("LEAKED_", "STRIPE_"))}
+              print("EnvLeakExample", leaked)
+
+              # echo in body
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({
+                      "ok": True,
+                      "env_leaks": leaked,
+                      "code_secret_fingerprint": STRIPE_SECRET_KEY[-6:]
+                  })
+              }
 
   BadLambdaLogGroup:
     Type: AWS::Logs::LogGroup
@@ -365,9 +325,7 @@ Resources:
       Principal: "*"
       FunctionUrlAuthType: NONE
 
-  ########################################
-  # API Gateway (one method open, one uses authorizer)
-  ########################################
+  # ---------------- API Gateway ----------------
   ApiGatewayRest:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -403,10 +361,7 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
                 Resource: "*"
 
   AuthorizerFunction:
@@ -463,8 +418,7 @@ Resources:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BadLambda.Arn}/invocations
-      MethodResponses:
-        - StatusCode: 200
+      MethodResponses: [{ StatusCode: 200 }]
 
   SecureGetMethod:
     Type: AWS::ApiGateway::Method
@@ -478,8 +432,7 @@ Resources:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BadLambda.Arn}/invocations
-      MethodResponses:
-        - StatusCode: 200
+      MethodResponses: [{ StatusCode: 200 }]
 
   ApiDeployment:
     Type: AWS::ApiGateway::Deployment
@@ -496,9 +449,7 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRest}/*/*/*"
 
-  ########################################
-  # IAM Anti-Patterns
-  ########################################
+  # ---------------- IAM Anti-Patterns ----------------
   EscalationAdminRole:
     Type: AWS::IAM::Role
     Properties:
@@ -507,20 +458,16 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal:
-              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Principal: { AWS: !Sub arn:aws:iam::${AWS::AccountId}:root }
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AdministratorAccess
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AdministratorAccess]
 
   BreakGlassUser:
     Type: AWS::IAM::User
     Properties:
       UserName: break-glass-admin
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AdministratorAccess
-      Tags:
-        - { Key: Purpose, Value: "BadLab" }
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AdministratorAccess]
+      Tags: [{ Key: Purpose, Value: BadLab }]
 
   BreakGlassAccessKey:
     Type: AWS::IAM::AccessKey
@@ -551,9 +498,7 @@ Resources:
     Properties:
       UserName: !Ref DevUser
 
-  ########################################
-  # Secrets Manager - publicly readable secret
-  ########################################
+  # ---------------- Public Secret ----------------
   BadSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -574,58 +519,26 @@ Resources:
             Action: "secretsmanager:GetSecretValue"
             Resource: !Ref BadSecret
 
-Conditions:
-  HasZipVersion: !Not [ !Equals [ !Ref LambdaZipVersionId, "" ] ]
-
 Outputs:
   PublicBucketNameOut:
     Value: !Ref PublicBucketName
-    Description: "Public S3 bucket (BPA disabled + public policy)."
-
   RDSAddress:
     Value: !GetAtt BadLabRDS.Endpoint.Address
-    Description: "Public RDS endpoint (Postgres) — effective access is PUBLIC due to BAD SG."
-
-  DBGoodSGId:
-    Value: !Ref DBGoodSG
-    Description: "GOOD DB SG (5432 from AppTierSG only)."
-
-  DBBadSGId:
-    Value: !Ref DBBadSG
-    Description: "BAD DB SG (5432 from 0.0.0.0/0)."
-
   BadLambdaRuntime:
     Value: !Ref LambdaRuntime
-    Description: "Lambda runtime in use (defaults to older python3.9)."
-
   BadLambdaFunctionUrl:
     Value: !GetAtt BadLambdaUrl.FunctionUrl
-    Description: "Public Lambda Function URL (no auth)."
-
   ApiInvokePublic:
     Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/public"
-    Description: "Open API endpoint (no authorizer)."
-
   ApiInvokeSecure:
     Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/secure"
-    Description: "API endpoint protected by custom authorizer (send header 'Authorization: allow')."
-
   BreakGlassAccessKeyId:
     Value: !Ref BreakGlassAccessKey
-    Description: "Break-glass admin user AccessKeyId."
-
   BreakGlassSecretAccessKey:
     Value: !GetAtt BreakGlassAccessKey.SecretAccessKey
-    Description: "Break-glass admin user SecretAccessKey (intentionally exposed)."
-
   DevUserAccessKeyId:
     Value: !Ref DevUserKey
-    Description: "Dev user AccessKeyId (*:* perms)."
-
   DevUserSecretAccessKey:
     Value: !GetAtt DevUserKey.SecretAccessKey
-    Description: "Dev user SecretAccessKey."
-
   EscalationAdminRoleArn:
     Value: !GetAtt EscalationAdminRole.Arn
-    Description: "Internal admin role trust = account root (dev-user can assume)."

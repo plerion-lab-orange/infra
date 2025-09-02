@@ -1,0 +1,53 @@
+name: Build & Deploy BadLab
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+  STACK_NAME: ${{ vars.STACK_NAME }}
+  PUBLIC_BUCKET_NAME: ${{ vars.PUBLIC_BUCKET_NAME }}
+
+concurrency:
+  group: badlab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build vulnerable layer
+        run: |
+          bash layers/vuln-py39/build.sh
+
+      - name: Upload layer to S3
+        run: |
+          aws s3 cp layers/vuln-py39/build/vuln-py39-layer.zip \
+            s3://${{ env.ARTIFACT_BUCKET }}/layers/vuln-py39-layer.zip
+
+      - name: Deploy CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ env.STACK_NAME }} \
+            --template-file infra/plerion-badlab.yaml \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              ArtifactBucket=${{ env.ARTIFACT_BUCKET }} \
+              VulnLayerKey=layers/vuln-py39-layer.zip \
+              PublicBucketName=${{ env.PUBLIC_BUCKET_NAME }}

@@ -1,29 +1,32 @@
 name: Build & Deploy BadLab
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
-  workflow_dispatch: {}
-
-permissions:
-  id-token: write
-  contents: read
+    paths:
+      - "infra/**"
+      - "layers/**"
+      - "lambda/**"
+      - ".github/workflows/deploy-badlab.yml"
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
   STACK_NAME: ${{ vars.STACK_NAME }}
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
   PUBLIC_BUCKET_NAME: ${{ vars.PUBLIC_BUCKET_NAME }}
-
-concurrency:
-  group: badlab-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
+      - name: Set up job
+        run: echo "starting…"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -34,54 +37,80 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Show repo tree
-        shell: bash
         run: |
-          pwd
-          git rev-parse --short HEAD
-          tree -a -I '.git' || (echo "(no tree)"; ls -laR | head -n 200)
+          echo "::group::tree"
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y tree >/dev/null 2>&1 || true
+          tree -a -I '.git' -L 3
+          echo "::endgroup::"
 
+      # ---- Build the vulnerable LAMBDA LAYER zip ----
       - name: Build vulnerable layer
-        shell: bash
-        run: |
-          bash layers/vuln-py39/build.sh
+        run: bash layers/vuln-py39/build.sh
 
-      - name: Upload layer to S3 (capture ETag & VersionId)
-        id: put
-        shell: bash
+      - name: Upload layer to S3 (capture VersionId)
+        id: upload_layer
         run: |
           set -euo pipefail
-          resp=$(aws s3api put-object \
+          aws s3api put-object \
             --bucket "$ARTIFACT_BUCKET" \
             --key "layers/vuln-py39-layer.zip" \
-            --body "layers/vuln-py39/build/vuln-py39-layer.zip")
+            --body "layers/vuln-py39/layer.zip" \
+            --output text --query VersionId > /tmp/layer_version.txt || echo "" > /tmp/layer_version.txt
+          echo "LAYER_VERSION_ID=$(cat /tmp/layer_version.txt)" >> $GITHUB_ENV
+          echo "Uploaded layer VersionId: $(cat /tmp/layer_version.txt || true)"
 
-          echo "$resp"
-          etag=$(printf '%s' "$resp" | jq -r '.ETag' | tr -d '"')
-          version=$(printf '%s' "$resp" | jq -r '.VersionId // empty')
+      # ---- Build the FUNCTION zip with vulnerable requirements.txt ----
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-          echo "etag=$etag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Uploaded layer: ETag=$etag  VersionId=${version:-none}"
+      - name: Build function ZIP (with vulnerable deps)
+        working-directory: lambda/hello
+        run: |
+          set -euo pipefail
+          rm -rf build hello.zip
+          mkdir -p build
+          cp index.py build/
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -t build/
+          cd build && zip -qr ../hello.zip .
 
+      - name: Upload function ZIP to S3 (capture VersionId)
+        id: upload_fn
+        working-directory: lambda/hello
+        run: |
+          set -euo pipefail
+          aws s3api put-object \
+            --bucket "$ARTIFACT_BUCKET" \
+            --key "lambda/hello.zip" \
+            --body "hello.zip" \
+            --output text --query VersionId > /tmp/lambda_version.txt || echo "" > /tmp/lambda_version.txt
+          echo "LAMBDA_ZIP_KEY=lambda/hello.zip" >> $GITHUB_ENV
+          echo "LAMBDA_ZIP_VERSION_ID=$(cat /tmp/lambda_version.txt)" >> $GITHUB_ENV
+          echo "Uploaded function ZIP VersionId: $(cat /tmp/lambda_version.txt || true)"
+
+      # ---- Deploy CFN ----
       - name: Deploy CloudFormation
-        shell: bash
         run: |
           set -euo pipefail
           aws cloudformation deploy \
             --stack-name "$STACK_NAME" \
             --template-file infra/plerion-badlab.yaml \
-            --region "$AWS_REGION" \
             --capabilities CAPABILITY_NAMED_IAM \
             --parameter-overrides \
+              PublicBucketName="$PUBLIC_BUCKET_NAME" \
               ArtifactBucket="$ARTIFACT_BUCKET" \
               VulnLayerKey="layers/vuln-py39-layer.zip" \
-              PublicBucketName="$PUBLIC_BUCKET_NAME" \
-              LayerS3Key="layers/vuln-py39-layer.zip" \
-              LayerContentHash="${{ steps.put.outputs.etag }}" \
-              LayerObjectVersion="${{ steps.put.outputs.version }}"
+              LambdaZipKey="$LAMBDA_ZIP_KEY" \
+              LambdaZipVersionId="$LAMBDA_ZIP_VERSION_ID" \
+              LambdaRuntime="python3.9" \
+              ApiStageName="prod"
 
       - name: Show stack outputs
-        shell: bash
         run: |
-          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-            --query "Stacks[0].Outputs" --output table
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[*].{OutputKey:OutputKey,Value:OutputValue}' \
+            --output table

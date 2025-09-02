@@ -458,9 +458,12 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { AWS: !Sub arn:aws:iam::${AWS::AccountId}:root }
-            Action: sts:AssumeRole
-      ManagedPolicyArns: [arn:aws:iam::aws:policy/AdministratorAccess]
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
 
   BreakGlassUser:
     Type: AWS::IAM::User

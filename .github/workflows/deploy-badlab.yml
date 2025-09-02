@@ -39,13 +39,18 @@ jobs:
           find layers/vuln-py39 -maxdepth 2 -type f -print || true
 
       # ---------- (A) Build the vulnerable Lambda Layer ----------
-      # This uses your existing layers/vuln-py39/build.sh to create vuln-py39-layer.zip
       - name: Build vulnerable layer
         working-directory: layers/vuln-py39
         run: |
           set -euo pipefail
           bash build.sh
-          ls -lh *.zip
+          LAYER_ZIP="build/vuln-py39-layer.zip"
+          if [[ ! -f "$LAYER_ZIP" ]]; then
+            echo "Expected layer zip not found at $LAYER_ZIP" >&2
+            exit 2
+          fi
+          ls -lh "$LAYER_ZIP"
+          echo "LAYER_ZIP=$LAYER_ZIP" >> "$GITHUB_ENV"
 
       - name: Upload layer to S3 (capture VersionId)
         working-directory: layers/vuln-py39
@@ -54,7 +59,7 @@ jobs:
           aws s3api put-object \
             --bucket "${ARTIFACT_BUCKET}" \
             --key "layers/vuln-py39-layer.zip" \
-            --body vuln-py39-layer.zip \
+            --body "${LAYER_ZIP}" \
             --output json > /tmp/put-layer.json
           echo "LAYER_VERSION=$(jq -r .VersionId /tmp/put-layer.json)" >> $GITHUB_ENV
           echo "LAYER_ETAG=$(jq -r .ETag /tmp/put-layer.json | tr -d '\"')" >> $GITHUB_ENV

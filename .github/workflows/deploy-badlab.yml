@@ -22,6 +22,7 @@ concurrency:
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,13 +34,14 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Show repo tree
+        shell: bash
         run: |
           pwd
-          ls -la
-          ls -la infra
-          ls -la layers/vuln-py39
+          git rev-parse --short HEAD
+          tree -a -I '.git' || (echo "(no tree)"; ls -laR | head -n 200)
 
       - name: Build vulnerable layer
+        shell: bash
         run: |
           bash layers/vuln-py39/build.sh
 
@@ -47,52 +49,39 @@ jobs:
         id: put
         shell: bash
         run: |
-          RESP=$(aws s3api put-object \
-            --bucket "${{ env.ARTIFACT_BUCKET }}" \
+          set -euo pipefail
+          resp=$(aws s3api put-object \
+            --bucket "$ARTIFACT_BUCKET" \
             --key "layers/vuln-py39-layer.zip" \
             --body "layers/vuln-py39/build/vuln-py39-layer.zip")
 
-          ETAG=$(echo "$RESP" | jq -r '.ETag' | tr -d '"')
-          VERSION=$(echo "$RESP" | jq -r '.VersionId // empty')
+          echo "$resp"
+          etag=$(printf '%s' "$resp" | jq -r '.ETag' | tr -d '"')
+          version=$(printf '%s' "$resp" | jq -r '.VersionId // empty')
 
-          echo "etag=$ETAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Uploaded layer with ETag=$ETAG VersionId=${VERSION:-none}"
-
-      # ---- FIXED: generate fake secrets without pipes (no SIGPIPE) ----
-      - name: Generate fake leaked secrets
-        id: gen
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, random, string
-          out = os.environ["GITHUB_OUTPUT"]
-          rng = random.SystemRandom()
-          def rand(chars, n): return ''.join(rng.choice(chars) for _ in range(n))
-          aki = 'AKIA' + rand('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 16)
-          sec = rand('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/+=', 40)
-          stripe = 'sk_live_' + rand(string.ascii_letters + string.digits, 32)
-          with open(out, 'a') as f:
-              f.write(f"aki={aki}\n")
-              f.write(f"sec={sec}\n")
-              f.write(f"stripe={stripe}\n")
-          PY
-          echo "Generated AKI=${{ steps.gen.outputs.aki || 'set below' }}"
+          echo "etag=$etag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Uploaded layer: ETag=$etag  VersionId=${version:-none}"
 
       - name: Deploy CloudFormation
+        shell: bash
         run: |
+          set -euo pipefail
           aws cloudformation deploy \
-            --stack-name ${{ env.STACK_NAME }} \
+            --stack-name "$STACK_NAME" \
             --template-file infra/plerion-badlab.yaml \
-            --region ${{ env.AWS_REGION }} \
+            --region "$AWS_REGION" \
             --capabilities CAPABILITY_NAMED_IAM \
             --parameter-overrides \
-              ArtifactBucket=${{ env.ARTIFACT_BUCKET }} \
-              VulnLayerKey=layers/vuln-py39-layer.zip \
-              PublicBucketName=${{ env.PUBLIC_BUCKET_NAME }} \
-              LayerS3Key=layers/vuln-py39-layer.zip \
-              LayerContentHash=${{ steps.put.outputs.etag }} \
-              LayerObjectVersion=${{ steps.put.outputs.version }} \
-              LeakedAwsAccessKeyId=${{ steps.gen.outputs.aki }} \
-              LeakedAwsSecretAccessKey=${{ steps.gen.outputs.sec }} \
-              StripeLiveSecret=${{ steps.gen.outputs.stripe }}
+              ArtifactBucket="$ARTIFACT_BUCKET" \
+              VulnLayerKey="layers/vuln-py39-layer.zip" \
+              PublicBucketName="$PUBLIC_BUCKET_NAME" \
+              LayerS3Key="layers/vuln-py39-layer.zip" \
+              LayerContentHash="${{ steps.put.outputs.etag }}" \
+              LayerObjectVersion="${{ steps.put.outputs.version }}"
+
+      - name: Show stack outputs
+        shell: bash
+        run: |
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs" --output table

@@ -288,4 +288,324 @@ Resources:
   VulnPy39Layer:
     Type: AWS::Lambda::LayerVersion
     Properties:
-      LayerName: plerion-badlab-vuln
+      LayerName: plerion-badlab-vuln-py39
+      Content:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref VulnLayerKey
+      CompatibleRuntimes: [python3.9]
+      Description: "Intentionally vulnerable Python packages (FOR LAB ONLY)"
+
+  BadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: plerion-badlab-hello
+      Runtime: !Ref LambdaRuntime
+      Handler: index.handler
+      Role: !GetAtt LambdaAdminRole.Arn
+      Timeout: 10
+      Layers: [!Ref VulnPy39Layer]
+      Environment:
+        Variables:
+          STRIPE_SECRET_KEY: "sk_live_REDACTED"
+          LEAKED_AWS_ACCESS_KEY_ID: "AKIAFAKEEXPOSED"
+          LEAKED_AWS_SECRET_ACCESS_KEY: "very-bad-to-store-here"
+      Code:
+        ZipFile: |
+          import os, json
+          import yaml, jinja2, requests, urllib3  # from the vuln layer
+          def handler(event, context):
+              print("Vuln lib versions", {
+                  "PyYAML": getattr(yaml, "__version__", None),
+                  "Jinja2": getattr(jinja2, "__version__", None),
+                  "requests": getattr(requests, "__version__", None),
+                  "urllib3": getattr(urllib3, "__version__", None),
+              })
+              print("EnvLeakExample", {k: v for k, v in os.environ.items()
+                     if k.startswith(("LEAKED_", "STRIPE_"))})
+              return {"statusCode": 200, "body": json.dumps({"ok": True})}
+
+  BadLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BadLambda}"
+      RetentionInDays: 1
+
+  BadLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref BadLambda
+      AuthType: NONE
+      Cors:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET","POST"]
+        AllowHeaders: ["*"]
+
+  BadLambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BadLambda
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  ########################################
+  # API Gateway (one method open, one uses authorizer)
+  ########################################
+  ApiGatewayRest:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: PlerionBadLabAPI
+      EndpointConfiguration: { Types: ["REGIONAL"] }
+
+  ApiResourcePublic:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRest
+      ParentId: !GetAtt ApiGatewayRest.RootResourceId
+      PathPart: public
+
+  ApiResourceSecure:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRest
+      ParentId: !GetAtt ApiGatewayRest.RootResourceId
+      PathPart: secure
+
+  AuthorizerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: plerion-badlab-authorizer
+      Runtime: !Ref LambdaRuntime
+      Handler: index.handler
+      Role: !GetAtt AuthorizerFunctionRole.Arn
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              token = (event.get('authorizationToken') or '').lower()
+              effect = 'Allow' if 'allow' in token else 'Deny'
+              return {
+                  "principalId": "user",
+                  "policyDocument": {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Action": "execute-api:Invoke",
+                          "Effect": effect,
+                          "Resource": event["methodArn"]
+                      }]
+                  }
+              }
+
+  AuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRest}/authorizers/*
+
+  TokenAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    DependsOn: AuthorizerPermission
+    Properties:
+      Name: !Sub "BadLabTokenAuthorizer-${AWS::StackName}"
+      RestApiId: !Ref ApiGatewayRest
+      Type: TOKEN
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations
+      IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: 0
+
+  PublicGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRest
+      ResourceId: !Ref ApiResourcePublic
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BadLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+
+  SecureGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRest
+      ResourceId: !Ref ApiResourceSecure
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref TokenAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BadLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [PublicGetMethod, SecureGetMethod]
+    Properties:
+      RestApiId: !Ref ApiGatewayRest
+      StageName: !Ref ApiStageName
+
+  LambdaInvokeFromApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BadLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRest}/*/*/*"
+
+  ########################################
+  # IAM Anti-Patterns
+  ########################################
+  EscalationAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PlerionBadLabEscalationAdminRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  BreakGlassUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: break-glass-admin
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Tags:
+        - { Key: Purpose, Value: "BadLab" }
+
+  BreakGlassAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref BreakGlassUser
+
+  DevsGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: plerion-badlab-devs
+      Policies:
+        - PolicyName: EverythingEverywhereAllAtOnce
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "*"
+                Resource: "*"
+
+  DevUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: dev-user
+      Groups: [!Ref DevsGroup]
+
+  DevUserKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref DevUser
+
+  ########################################
+  # Secrets Manager - publicly readable secret
+  ########################################
+  BadSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: plerion/badlab/public-secret
+      Description: "Intentionally misconfigured: public-readable secret"
+      SecretString: '{"SuperSecretProdKey":"shh-12345"}'
+
+  BadSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref BadSecret
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAnyoneReadSecret
+            Effect: Allow
+            Principal: "*"
+            Action: "secretsmanager:GetSecretValue"
+            Resource: !Ref BadSecret
+
+Outputs:
+  PublicBucketNameOut:
+    Value: !Ref PublicBucketName
+    Description: "Public S3 bucket (BPA disabled + public policy)."
+
+  RDSAddress:
+    Value: !GetAtt BadLabRDS.Endpoint.Address
+    Description: "Public RDS endpoint (Postgres) — effective access is PUBLIC due to BAD SG."
+
+  DBGoodSGId:
+    Value: !Ref DBGoodSG
+    Description: "GOOD DB SG (5432 from AppTierSG only)."
+
+  DBBadSGId:
+    Value: !Ref DBBadSG
+    Description: "BAD DB SG (5432 from 0.0.0.0/0)."
+
+  BadLambdaRuntime:
+    Value: !Ref LambdaRuntime
+    Description: "Lambda runtime in use (defaults to older python3.9)."
+
+  BadLambdaFunctionUrl:
+    Value: !GetAtt BadLambdaUrl.FunctionUrl
+    Description: "Public Lambda Function URL (no auth)."
+
+  ApiInvokePublic:
+    Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/public"
+    Description: "Open API endpoint (no authorizer)."
+
+  ApiInvokeSecure:
+    Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/secure"
+    Description: "API endpoint protected by custom authorizer (send header 'Authorization: allow')."
+
+  BreakGlassAccessKeyId:
+    Value: !Ref BreakGlassAccessKey
+    Description: "Break-glass admin user AccessKeyId."
+
+  BreakGlassSecretAccessKey:
+    Value: !GetAtt BreakGlassAccessKey.SecretAccessKey
+    Description: "Break-glass admin user SecretAccessKey (intentionally exposed)."
+
+  DevUserAccessKeyId:
+    Value: !Ref DevUserKey
+    Description: "Dev user AccessKeyId (*:* perms)."
+
+  DevUserSecretAccessKey:
+    Value: !GetAtt DevUserKey.SecretAccessKey
+    Description: "Dev user SecretAccessKey."
+
+  EscalationAdminRoleArn:
+    Value: !GetAtt EscalationAdminRole.Arn
+    Description: "Internal admin role trust = account root (dev-user can assume)."

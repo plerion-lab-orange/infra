@@ -5,7 +5,7 @@ Description: >
   - API Gateway with mixed auth (one secured by custom authorizer, one public)
   - Public S3 bucket (BPA disabled + public policy)
   - SQS queue open to the world
-  - Lambda: outdated runtime (python3.9), public Function URL, admin perms, secrets in env + code
+  - Lambda: outdated runtime (python3.9), public Function URL, admin perms, secrets in env
   - IAM anti-patterns: internal escalation admin role; break-glass users with keys; *:* dev group
   - Publicly readable Secrets Manager secret
   - Vulnerable packages provided via Lambda Layer (built from lock file)
@@ -35,24 +35,26 @@ Parameters:
   ArtifactBucket:
     Type: String
     Description: S3 bucket that holds Lambda code/layer zips.
+
+  # (Kept for compatibility if referenced elsewhere, but not used by the layer anymore)
   VulnLayerKey:
     Type: String
     Default: layers/vuln-py39-layer.zip
     Description: S3 key for the vulnerable Python layer zip.
 
-  # --- knobs to force a new LayerVersion when content changes ---
+  # New inputs the workflow passes so we don't rely on any pseudo-timestamps
   LayerS3Key:
     Type: String
     Default: layers/vuln-py39-layer.zip
-  LayerContentHash:
-    Type: String
-    Default: nohash
+    Description: S3 key for the uploaded layer zip (from CI).
   LayerObjectVersion:
     Type: String
     Default: ""
-
-Conditions:
-  HasLayerObjectVersion: !Not [ !Equals [ !Ref LayerObjectVersion, "" ] ]
+    Description: Optional S3 VersionId for the layer object (if your artifact bucket is versioned).
+  LayerContentHash:
+    Type: String
+    Default: ""
+    Description: Optional content hash (e.g., ETag) to annotate the layer description and force updates.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -60,13 +62,16 @@ Metadata:
       - Label: { default: "General" }
         Parameters: [ApiStageName]
       - Label: { default: "S3" }
-        Parameters: [PublicBucketName]
+        Parameters: [PublicBucketName, ArtifactBucket, LayerS3Key, LayerObjectVersion, LayerContentHash]
       - Label: { default: "RDS" }
         Parameters: [DBMasterUsername, DBMasterPassword]
       - Label: { default: "Lambda" }
-        Parameters: [LambdaRuntime, ArtifactBucket, VulnLayerKey]
+        Parameters: [LambdaRuntime]
     ParameterLabels:
       PublicBucketName: { default: "Public S3 bucket name (must be unique)" }
+
+Conditions:
+  HasLayerObjectVersion: !Not [ !Equals [ !Ref LayerObjectVersion, "" ] ]
 
 Resources:
 
@@ -272,7 +277,7 @@ Resources:
             Resource: !GetAtt OpenQueue.Arn
 
   ########################################
-  # Lambda: OLD runtime, admin perms, secrets in env + code,
+  # Lambda: OLD runtime, admin perms, secrets in env,
   # public URL + vuln layer
   ########################################
   LambdaAdminRole:
@@ -303,7 +308,7 @@ Resources:
     Type: AWS::Lambda::LayerVersion
     Properties:
       LayerName: plerion-badlab-vuln-py39
-      Description: !Sub "Badlab vuln layer ${LayerContentHash}"
+      Description: !Sub "Intentionally vulnerable Python packages (hash=${LayerContentHash})"
       Content:
         S3Bucket: !Ref ArtifactBucket
         S3Key: !Ref LayerS3Key
@@ -321,20 +326,13 @@ Resources:
       Layers: [!Ref VulnPy39Layer]
       Environment:
         Variables:
-          # Static values to simulate leaked env secrets (kept to show “env leak”)
-          STRIPE_SECRET_KEY: "sk_live_T0k3nG0esHere0123456789abcd"
-          LEAKED_AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE"
-          LEAKED_AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+          STRIPE_SECRET_KEY: "sk_live_REDACTED"
+          LEAKED_AWS_ACCESS_KEY_ID: "AKIAFAKEEXPOSED"
+          LEAKED_AWS_SECRET_ACCESS_KEY: "very-bad-to-store-here"
       Code:
         ZipFile: |
           import os, json
           import yaml, jinja2, requests, urllib3  # from the vuln layer
-
-          # Hardcoded secrets inside the code (for demo only)
-          LEAKED_AWS_ACCESS_KEY_ID  = "AKIAIOSFODNN7EXAMPLE"
-          LEAKED_AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-          STRIPE_SECRET_KEY = "sk_live_T0k3nG0esHere0123456789abcd"
-
           def handler(event, context):
               print("Vuln lib versions", {
                   "PyYAML": getattr(yaml, "__version__", None),
@@ -342,15 +340,8 @@ Resources:
                   "requests": getattr(requests, "__version__", None),
                   "urllib3": getattr(urllib3, "__version__", None),
               })
-              print("HardcodedSecrets", {
-                  "AKI": LEAKED_AWS_ACCESS_KEY_ID,
-                  "AWS_SECRET": LEAKED_AWS_SECRET_ACCESS_KEY,
-                  "STRIPE": STRIPE_SECRET_KEY,
-              })
-              print("EnvLeakExample", {
-                  k: v for k, v in os.environ.items()
-                  if k.startswith(("LEAKED_", "STRIPE_"))
-              })
+              print("EnvLeakExample", {k: v for k, v in os.environ.items()
+                     if k.startswith(("LEAKED_", "STRIPE_"))})
               return {"statusCode": 200, "body": json.dumps({"ok": True})}
 
   BadLambdaLogGroup:
@@ -499,7 +490,6 @@ Resources:
     Properties:
       RestApiId: !Ref ApiGatewayRest
       StageName: !Ref ApiStageName
-      Description: !Sub "Deployed at ${AWS::Timestamp}"
 
   LambdaInvokeFromApiPermission:
     Type: AWS::Lambda::Permission
@@ -563,79 +553,3 @@ Resources:
     Type: AWS::IAM::AccessKey
     Properties:
       UserName: !Ref DevUser
-
-  ########################################
-  # Secrets Manager - publicly readable secret
-  ########################################
-  BadSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: plerion/badlab/public-secret
-      Description: "Intentionally misconfigured: public-readable secret"
-      SecretString: '{"SuperSecretProdKey":"shh-12345"}'
-
-  BadSecretPolicy:
-    Type: AWS::SecretsManager::ResourcePolicy
-    Properties:
-      SecretId: !Ref BadSecret
-      ResourcePolicy:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: AllowAnyoneReadSecret
-            Effect: Allow
-            Principal: "*"
-            Action: "secretsmanager:GetSecretValue"
-            Resource: !Ref BadSecret
-
-Outputs:
-  PublicBucketNameOut:
-    Value: !Ref PublicBucketName
-    Description: "Public S3 bucket (BPA disabled + public policy)."
-
-  RDSAddress:
-    Value: !GetAtt BadLabRDS.Endpoint.Address
-    Description: "Public RDS endpoint (Postgres) — effective access is PUBLIC due to BAD SG."
-
-  DBGoodSGId:
-    Value: !Ref DBGoodSG
-    Description: "GOOD DB SG (5432 from AppTierSG only)."
-
-  DBBadSGId:
-    Value: !Ref DBBadSG
-    Description: "BAD DB SG (5432 from 0.0.0.0/0)."
-
-  BadLambdaRuntime:
-    Value: !Ref LambdaRuntime
-    Description: "Lambda runtime in use (defaults to older python3.9)."
-
-  BadLambdaFunctionUrl:
-    Value: !GetAtt BadLambdaUrl.FunctionUrl
-    Description: "Public Lambda Function URL (no auth)."
-
-  ApiInvokePublic:
-    Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/public"
-    Description: "Open API endpoint (no authorizer)."
-
-  ApiInvokeSecure:
-    Value: !Sub "https://${ApiGatewayRest}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/secure"
-    Description: "API endpoint protected by custom authorizer (send header 'Authorization: allow')."
-
-  BreakGlassAccessKeyId:
-    Value: !Ref BreakGlassAccessKey
-    Description: "Break-glass admin user AccessKeyId."
-
-  BreakGlassSecretAccessKey:
-    Value: !GetAtt BreakGlassAccessKey.SecretAccessKey
-    Description: "Break-glass admin user SecretAccessKey (intentionally exposed)."
-
-  DevUserAccessKeyId:
-    Value: !Ref DevUserKey
-    Description: "Dev user AccessKeyId (*:* perms)."
-
-  DevUserSecretAccessKey:
-    Value: !GetAtt DevUserKey.SecretAccessKey
-    Description: "Dev user SecretAccessKey."
-
-  EscalationAdminRoleArn:
-    Value: !GetAtt EscalationAdminRole.Arn
-    Description: "Internal admin role trust = account root (dev-user can assume)."

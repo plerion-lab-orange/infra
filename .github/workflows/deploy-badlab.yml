@@ -67,7 +67,7 @@ jobs:
           python-version: '3.11'
 
       - name: Build function ZIP (with vulnerable deps)
-        working-directory: lambda/hello
+        working-directory: layers/vuln-py39/lambda/hello
         run: |
           set -euo pipefail
           rm -rf build hello.zip

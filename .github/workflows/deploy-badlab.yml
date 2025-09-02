@@ -43,7 +43,6 @@ jobs:
         run: |
           bash layers/vuln-py39/build.sh
 
-      # Upload via s3api so we get ETag (content hash) and VersionId (if bucket versioning on)
       - name: Upload layer to S3 (capture ETag & VersionId)
         id: put
         shell: bash
@@ -60,18 +59,25 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Uploaded layer with ETag=$ETAG VersionId=${VERSION:-none}"
 
-      # Generate realistic-looking leaked keys for Lambda env
+      # ---- FIXED: generate fake secrets without pipes (no SIGPIPE) ----
       - name: Generate fake leaked secrets
         id: gen
         shell: bash
         run: |
-          AKI="AKIA$(tr -dc 'A-Z0-9' </dev/urandom | head -c 16)"
-          SEC="$(tr -dc 'A-Za-z0-9/+=' </dev/urandom | head -c 40)"
-          STRIPE="sk_live_$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
-          echo "aki=$AKI" >> "$GITHUB_OUTPUT"
-          echo "sec=$SEC" >> "$GITHUB_OUTPUT"
-          echo "stripe=$STRIPE" >> "$GITHUB_OUTPUT"
-          echo "Generated AKI=$AKI STRIPE=$STRIPE"
+          python - <<'PY'
+          import os, random, string
+          out = os.environ["GITHUB_OUTPUT"]
+          rng = random.SystemRandom()
+          def rand(chars, n): return ''.join(rng.choice(chars) for _ in range(n))
+          aki = 'AKIA' + rand('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 16)
+          sec = rand('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/+=', 40)
+          stripe = 'sk_live_' + rand(string.ascii_letters + string.digits, 32)
+          with open(out, 'a') as f:
+              f.write(f"aki={aki}\n")
+              f.write(f"sec={sec}\n")
+              f.write(f"stripe={stripe}\n")
+          PY
+          echo "Generated AKI=${{ steps.gen.outputs.aki || 'set below' }}"
 
       - name: Deploy CloudFormation
         run: |
@@ -84,7 +90,6 @@ jobs:
               ArtifactBucket=${{ env.ARTIFACT_BUCKET }} \
               VulnLayerKey=layers/vuln-py39-layer.zip \
               PublicBucketName=${{ env.PUBLIC_BUCKET_NAME }} \
-              # new/changed bits:
               LayerS3Key=layers/vuln-py39-layer.zip \
               LayerContentHash=${{ steps.put.outputs.etag }} \
               LayerObjectVersion=${{ steps.put.outputs.version }} \

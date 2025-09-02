@@ -5,7 +5,7 @@ Description: >
   - API Gateway with mixed auth (one secured by custom authorizer, one public)
   - Public S3 bucket (BPA disabled + public policy)
   - SQS queue open to the world
-  - Lambda: outdated runtime (python3.9), public Function URL, admin perms, secrets in env
+  - Lambda: outdated runtime (python3.9), public Function URL, admin perms, secrets in env + code
   - IAM anti-patterns: internal escalation admin role; break-glass users with keys; *:* dev group
   - Publicly readable Secrets Manager secret
   - Vulnerable packages provided via Lambda Layer (built from lock file)
@@ -40,26 +40,7 @@ Parameters:
     Default: layers/vuln-py39-layer.zip
     Description: S3 key for the vulnerable Python layer zip.
 
-  # ---- new secrets (populated by CI each deploy) ----
-  LeakedAwsAccessKeyId:
-    Type: String
-    Description: "Fake-but-realistic AWS access key id (auto-set by CI)."
-    AllowedPattern: '^AKIA[0-9A-Z]{16}$'
-    Default: AKIAEXAMPLEEXAMPLE
-  LeakedAwsSecretAccessKey:
-    Type: String
-    NoEcho: true
-    Description: "Fake-but-realistic AWS secret access key (auto-set by CI)."
-    AllowedPattern: '^[A-Za-z0-9/+=]{40}$'
-    Default: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-  StripeLiveSecret:
-    Type: String
-    NoEcho: true
-    Description: "Fake-but-realistic Stripe live secret (auto-set by CI)."
-    AllowedPattern: '^sk_live_[A-Za-z0-9]{24,64}$'
-    Default: sk_live_EXAMPLEEXAMPLEEXAMPLEEXAMPLE
-
-  # ---- new knobs to force a new LayerVersion on content change ----
+  # --- knobs to force a new LayerVersion when content changes ---
   LayerS3Key:
     Type: String
     Default: layers/vuln-py39-layer.zip
@@ -291,7 +272,7 @@ Resources:
             Resource: !GetAtt OpenQueue.Arn
 
   ########################################
-  # Lambda: OLD runtime, admin perms, secrets in env,
+  # Lambda: OLD runtime, admin perms, secrets in env + code,
   # public URL + vuln layer
   ########################################
   LambdaAdminRole:
@@ -340,13 +321,20 @@ Resources:
       Layers: [!Ref VulnPy39Layer]
       Environment:
         Variables:
-          STRIPE_SECRET_KEY: !Ref StripeLiveSecret
-          LEAKED_AWS_ACCESS_KEY_ID: !Ref LeakedAwsAccessKeyId
-          LEAKED_AWS_SECRET_ACCESS_KEY: !Ref LeakedAwsSecretAccessKey
+          # Static values to simulate leaked env secrets (kept to show “env leak”)
+          STRIPE_SECRET_KEY: "sk_live_T0k3nG0esHere0123456789abcd"
+          LEAKED_AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE"
+          LEAKED_AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
       Code:
         ZipFile: |
           import os, json
           import yaml, jinja2, requests, urllib3  # from the vuln layer
+
+          # Hardcoded secrets inside the code (for demo only)
+          LEAKED_AWS_ACCESS_KEY_ID  = "AKIAIOSFODNN7EXAMPLE"
+          LEAKED_AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+          STRIPE_SECRET_KEY = "sk_live_T0k3nG0esHere0123456789abcd"
+
           def handler(event, context):
               print("Vuln lib versions", {
                   "PyYAML": getattr(yaml, "__version__", None),
@@ -354,8 +342,15 @@ Resources:
                   "requests": getattr(requests, "__version__", None),
                   "urllib3": getattr(urllib3, "__version__", None),
               })
-              print("EnvLeakExample", {k: v for k, v in os.environ.items()
-                     if k.startswith(("LEAKED_", "STRIPE_"))})
+              print("HardcodedSecrets", {
+                  "AKI": LEAKED_AWS_ACCESS_KEY_ID,
+                  "AWS_SECRET": LEAKED_AWS_SECRET_ACCESS_KEY,
+                  "STRIPE": STRIPE_SECRET_KEY,
+              })
+              print("EnvLeakExample", {
+                  k: v for k, v in os.environ.items()
+                  if k.startswith(("LEAKED_", "STRIPE_"))
+              })
               return {"statusCode": 200, "body": json.dumps({"ok": True})}
 
   BadLambdaLogGroup:

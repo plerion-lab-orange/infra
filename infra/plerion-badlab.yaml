@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Plerion Misconfig Lab (Auto CI) - Intentionally insecure resources for workshops:
+  - Public RDS with both GOOD and BAD SGs attached (bad rule overrides good)
+  - API Gateway with mixed auth (one secured by custom authorizer, one public)
+  - Public S3 bucket (BPA disabled + public policy)
+  - SQS queue open to the world
+  - Lambda: outdated runtime (python3.9), public Function URL, admin perms, secrets in env
+  - IAM anti-patterns: internal escalation admin role; break-glass users with keys; *:* dev group
+  - Publicly readable Secrets Manager secret
+  - Vulnerable packages provided via Lambda Layer (built from lock file)
+
+Parameters:
+  PublicBucketName:
+    Type: String
+    Description: Globally-unique S3 bucket name.
+  DBMasterUsername:
+    Type: String
+    Default: badlabuser
+    AllowedPattern: '^(?!admin$)(?!postgres$)[a-zA-Z][a-zA-Z0-9_]{0,62}$'
+    ConstraintDescription: "Username cannot be 'admin' or 'postgres'; 1–63 chars, start with a letter."
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    Default: Pl3rionBadLab123!
+    Description: Plaintext DB password to simulate hardcoding.
+  LambdaRuntime:
+    Type: String
+    Default: python3.9
+    AllowedValues: [python3.9, python3.10, python3.11, python3.12]
+    Description: Older runtime by default (swap to 3.10/3.11 if 3.9 creation is blocked in your region).
+  ApiStageName:
+    Type: String
+    Default: prod
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket that holds Lambda code/layer zips.
+  VulnLayerKey:
+    Type: String
+    Default: layers/vuln-py39-layer.zip
+    Description: S3 key for the vulnerable Python layer zip.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "General" }
+        Parameters: [ApiStageName]
+      - Label: { default: "S3" }
+        Parameters: [PublicBucketName]
+      - Label: { default: "RDS" }
+        Parameters: [DBMasterUsername, DBMasterPassword]
+      - Label: { default: "Lambda" }
+        Parameters: [LambdaRuntime, ArtifactBucket, VulnLayerKey]
+    ParameterLabels:
+      PublicBucketName: { default: "Public S3 bucket name (must be unique)" }
+
+Resources:
+
+  ########################################
+  # Networking (simple public VPC)
+  ########################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: PlerionBadLabVPC }]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: PlerionBadLabPublicA }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: PlerionBadLabPublicB }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  PublicSubnetARouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  ########################################
+  # Security Groups & RDS
+  ########################################
+  OverPermissiveSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Intentionally over-permissive: ALL traffic from 0.0.0.0/0"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Everything inbound (bad)"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Everything outbound (overbroad)"
+      Tags: [{ Key: Name, Value: PlerionBadLabAllowAll }]
+
+  AppTierSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "App tier SG (simulated producer)"
+      VpcId: !Ref VPC
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  DBGoodSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "GOOD: Only allow Postgres from AppTierSG"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppTierSG
+          Description: "Postgres from App tier only"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  DBBadSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "BAD: Postgres open to the world"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+          Description: "Public Postgres (bad)"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: PlerionBadLab Public DB subnets
+      SubnetIds: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+
+  BadLabRDS:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: plerion-badlab-db
+      DBName: badlab
+      Engine: postgres
+      EngineVersion: '15'
+      PubliclyAccessible: true
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      VPCSecurityGroups:
+        - !Ref DBGoodSG
+        - !Ref DBBadSG
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 0
+      AutoMinorVersionUpgrade: false
+      StorageEncrypted: false
+      MultiAZ: false
+      DeletionProtection: false
+      EnableCloudwatchLogsExports: []
+
+  ########################################
+  # S3 - Public bucket (BPA disabled + public bucket policy)
+  ########################################
+  PublicBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref PublicBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      Tags:
+        - { Key: Purpose, Value: "BadLabPublic" }
+
+  PublicBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PublicBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowGetFromAnyone
+            Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "${PublicBucket.Arn}/*"
+
+  ########################################
+  # SQS - Open to the world
+  ########################################
+  OpenQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: plerion-badlab-open-queue
+
+  OpenQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OpenQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAllOnQueue
+            Effect: Allow
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt OpenQueue.Arn
+
+  ########################################
+  # Lambda: OLD runtime, admin perms, secrets in env,
+  # public URL + vuln layer
+  ########################################
+  LambdaAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PlerionBadLabLambdaAdminRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: BasicLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  VulnPy39Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: plerion-badlab-vuln

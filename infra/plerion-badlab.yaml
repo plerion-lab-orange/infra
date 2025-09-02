@@ -40,6 +40,39 @@ Parameters:
     Default: layers/vuln-py39-layer.zip
     Description: S3 key for the vulnerable Python layer zip.
 
+  # ---- new secrets (populated by CI each deploy) ----
+  LeakedAwsAccessKeyId:
+    Type: String
+    Description: "Fake-but-realistic AWS access key id (auto-set by CI)."
+    AllowedPattern: '^AKIA[0-9A-Z]{16}$'
+    Default: AKIAEXAMPLEEXAMPLE
+  LeakedAwsSecretAccessKey:
+    Type: String
+    NoEcho: true
+    Description: "Fake-but-realistic AWS secret access key (auto-set by CI)."
+    AllowedPattern: '^[A-Za-z0-9/+=]{40}$'
+    Default: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  StripeLiveSecret:
+    Type: String
+    NoEcho: true
+    Description: "Fake-but-realistic Stripe live secret (auto-set by CI)."
+    AllowedPattern: '^sk_live_[A-Za-z0-9]{24,64}$'
+    Default: sk_live_EXAMPLEEXAMPLEEXAMPLEEXAMPLE
+
+  # ---- new knobs to force a new LayerVersion on content change ----
+  LayerS3Key:
+    Type: String
+    Default: layers/vuln-py39-layer.zip
+  LayerContentHash:
+    Type: String
+    Default: nohash
+  LayerObjectVersion:
+    Type: String
+    Default: ""
+
+Conditions:
+  HasLayerObjectVersion: !Not [ !Equals [ !Ref LayerObjectVersion, "" ] ]
+
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -289,11 +322,12 @@ Resources:
     Type: AWS::Lambda::LayerVersion
     Properties:
       LayerName: plerion-badlab-vuln-py39
+      Description: !Sub "Badlab vuln layer ${LayerContentHash}"
       Content:
         S3Bucket: !Ref ArtifactBucket
-        S3Key: !Ref VulnLayerKey
+        S3Key: !Ref LayerS3Key
+        S3ObjectVersion: !If [ HasLayerObjectVersion, !Ref LayerObjectVersion, !Ref AWS::NoValue ]
       CompatibleRuntimes: [python3.9]
-      Description: "Intentionally vulnerable Python packages (FOR LAB ONLY)"
 
   BadLambda:
     Type: AWS::Lambda::Function
@@ -306,9 +340,9 @@ Resources:
       Layers: [!Ref VulnPy39Layer]
       Environment:
         Variables:
-          STRIPE_SECRET_KEY: "sk_live_REDACTED"
-          LEAKED_AWS_ACCESS_KEY_ID: "AKIAFAKEEXPOSED"
-          LEAKED_AWS_SECRET_ACCESS_KEY: "very-bad-to-store-here"
+          STRIPE_SECRET_KEY: !Ref StripeLiveSecret
+          LEAKED_AWS_ACCESS_KEY_ID: !Ref LeakedAwsAccessKeyId
+          LEAKED_AWS_SECRET_ACCESS_KEY: !Ref LeakedAwsSecretAccessKey
       Code:
         ZipFile: |
           import os, json
@@ -470,6 +504,7 @@ Resources:
     Properties:
       RestApiId: !Ref ApiGatewayRest
       StageName: !Ref ApiStageName
+      Description: !Sub "Deployed at ${AWS::Timestamp}"
 
   LambdaInvokeFromApiPermission:
     Type: AWS::Lambda::Permission

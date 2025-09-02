@@ -10,9 +10,13 @@ permissions:
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
-  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
   STACK_NAME: ${{ vars.STACK_NAME }}
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
   PUBLIC_BUCKET_NAME: ${{ vars.PUBLIC_BUCKET_NAME }}
+
+defaults:
+  run:
+    shell: bash -euo pipefail
 
 jobs:
   build-deploy:
@@ -27,97 +31,96 @@ jobs:
         with:
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: gh-badlab-deploy
 
       - name: Show repo tree
         run: |
-          pwd
-          ls -lah
-          echo "---- lambda/hello ----"
-          find layers/vuln-py39/lambda/hello -maxdepth 2 -type f -print || true
-          echo "---- layer root ----"
-          find layers/vuln-py39 -maxdepth 2 -type f -print || true
+          echo "::group::tree"
+          git --version
+          ls -la
+          tree -a -I '.git|node_modules' || true
+          echo "::endgroup::"
 
-      # ---------- (A) Build the vulnerable Lambda Layer ----------
-      - name: Build vulnerable layer
+      # ──────────────────────────────────────────────────────────────
+      # Build the vulnerable layer ZIP under layers/vuln-py39/build/
+      # ──────────────────────────────────────────────────────────────
+      - name: Build vulnerable layer (python3.9)
+        id: build_layer
         working-directory: layers/vuln-py39
         run: |
-          set -euo pipefail
-          bash build.sh
-          LAYER_ZIP="build/vuln-py39-layer.zip"
-          if [[ ! -f "$LAYER_ZIP" ]]; then
-            echo "Expected layer zip not found at $LAYER_ZIP" >&2
-            exit 2
-          fi
-          ls -lh "$LAYER_ZIP"
-          echo "LAYER_ZIP=$LAYER_ZIP" >> "$GITHUB_ENV"
+          docker build -t badlab-py39 .
+          docker run --rm -v "$PWD":/opt -w /opt badlab-py39 bash -lc '
+            python -V
+            yum -y install zip >/dev/null 2>&1 || true
+            mkdir -p build/python
+            pip install --no-cache-dir -r /opt/requirements.lock.txt -t build/python
+            cd build && zip -r9 vuln-py39-layer.zip python
+          '
+          echo "layer_zip=$PWD/build/vuln-py39-layer.zip" >> "$GITHUB_OUTPUT"
 
       - name: Upload layer to S3 (capture VersionId)
-        working-directory: layers/vuln-py39
+        id: upload_layer
         run: |
-          set -euo pipefail
-          aws s3api put-object \
-            --bucket "${ARTIFACT_BUCKET}" \
-            --key "layers/vuln-py39-layer.zip" \
-            --body "${LAYER_ZIP}" \
-            --output json > /tmp/put-layer.json
-          echo "LAYER_VERSION=$(jq -r .VersionId /tmp/put-layer.json)" >> $GITHUB_ENV
-          echo "LAYER_ETAG=$(jq -r .ETag /tmp/put-layer.json | tr -d '\"')" >> $GITHUB_ENV
-          echo "Uploaded layer to s3://${ARTIFACT_BUCKET}/layers/vuln-py39-layer.zip"
+          LAYER_KEY="layers/vuln-py39-layer.zip"
+          ZIP="${{ steps.build_layer.outputs.layer_zip }}"
+          echo "Uploading layer: $ZIP -> s3://$ARTIFACT_BUCKET/$LAYER_KEY"
+          RESP="$(aws s3api put-object --bucket "$ARTIFACT_BUCKET" --key "$LAYER_KEY" --body "$ZIP")"
+          echo "$RESP"
+          VERSION="$(jq -r '.VersionId // ""' <<<"$RESP")"
+          echo "layer_key=$LAYER_KEY"            >> "$GITHUB_OUTPUT"
+          echo "layer_version=$VERSION"          >> "$GITHUB_OUTPUT"
 
-      # ---------- (B) Build the function ZIP with vulnerable deps ----------
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
+      # ──────────────────────────────────────────────────────────────
+      # Build the function.zip (with vulnerable deps) in the same
+      # python3.9 container so wheels match the Lambda runtime.
+      # ──────────────────────────────────────────────────────────────
       - name: Build function ZIP (with vulnerable deps)
-        working-directory: layers/vuln-py39/lambda/hello
+        id: build_fn
+        working-directory: lambda/hello
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          # Install pinned vulnerable packages into ./python
-          pip install -r requirements.txt -t python
-          # Package app code + site-packages
-          zip -r9 function.zip index.py
-          cd python && zip -r9 ../function.zip . && cd -
-          ls -lh function.zip
+          docker run --rm -v "$PWD":/opt -w /opt badlab-py39 bash -lc '
+            yum -y install zip >/dev/null 2>&1 || true
+            rm -rf build && mkdir -p build/python
+            pip install --no-cache-dir -r requirements.txt -t build/python
+            cp index.py build/
+            (cd build && zip -r9 function.zip .)
+          '
+          echo "fn_zip=$PWD/build/function.zip" >> "$GITHUB_OUTPUT"
 
       - name: Upload function ZIP to S3 (capture VersionId)
-        working-directory: layers/vuln-py39/lambda/hello
+        id: upload_fn
         run: |
-          set -euo pipefail
-          aws s3api put-object \
-            --bucket "${ARTIFACT_BUCKET}" \
-            --key "function/hello.zip" \
-            --body function.zip \
-            --output json > /tmp/put-func.json
-          echo "ZIP_VERSION=$(jq -r .VersionId /tmp/put-func.json)" >> $GITHUB_ENV
-          echo "ZIP_ETAG=$(jq -r .ETag /tmp/put-func.json | tr -d '\"')" >> $GITHUB_ENV
-          echo "Uploaded function ZIP to s3://${ARTIFACT_BUCKET}/function/hello.zip"
+          FN_KEY="lambda/hello/function.zip"
+          ZIP="${{ steps.build_fn.outputs.fn_zip }}"
+          echo "Uploading function: $ZIP -> s3://$ARTIFACT_BUCKET/$FN_KEY"
+          RESP="$(aws s3api put-object --bucket "$ARTIFACT_BUCKET" --key "$FN_KEY" --body "$ZIP")"
+          echo "$RESP"
+          VERSION="$(jq -r '.VersionId // ""' <<<"$RESP")"
+          echo "fn_key=$FN_KEY"                 >> "$GITHUB_OUTPUT"
+          echo "fn_version=$VERSION"            >> "$GITHUB_OUTPUT"
 
-      # ---------- (C) Deploy / Update the stack ----------
+      # ──────────────────────────────────────────────────────────────
+      # Deploy CloudFormation
+      # (Template must accept FunctionS3Key, FunctionS3ObjectVersion,
+      #  VulnLayerKey, LayerS3ObjectVersion, ArtifactBucket, etc.)
+      # ──────────────────────────────────────────────────────────────
       - name: Deploy CloudFormation
         run: |
-          set -euo pipefail
           aws cloudformation deploy \
-            --stack-name "${STACK_NAME}" \
+            --stack-name "$STACK_NAME" \
             --template-file infra/plerion-badlab.yaml \
-            --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
             --parameter-overrides \
-              PublicBucketName="${PUBLIC_BUCKET_NAME}" \
-              ArtifactBucket="${ARTIFACT_BUCKET}" \
-              VulnLayerKey="layers/vuln-py39-layer.zip" \
-              FuncZipKey="function/hello.zip" \
-              LambdaRuntime="python3.9" \
-              ApiStageName="prod" \
-              DBMasterUsername="badlabuser" \
-              DBMasterPassword="Pl3rionBadLab123!" \
-              LastUpdatedTs="$(date +%s)"
+              PublicBucketName="$PUBLIC_BUCKET_NAME" \
+              ArtifactBucket="$ARTIFACT_BUCKET" \
+              VulnLayerKey="${{ steps.upload_layer.outputs.layer_key }}" \
+              LayerS3ObjectVersion="${{ steps.upload_layer.outputs.layer_version }}" \
+              FunctionS3Key="${{ steps.upload_fn.outputs.fn_key }}" \
+              FunctionS3ObjectVersion="${{ steps.upload_fn.outputs.fn_version }}" \
+              LambdaRuntime="python3.9"
 
       - name: Show stack outputs
         run: |
           aws cloudformation describe-stacks \
-            --stack-name "${STACK_NAME}" \
-            --query 'Stacks[0].Outputs' \
-            --output table
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs" --output table

@@ -19,7 +19,7 @@ and auto-deploys a CloudFormation stack on every push to `main`.
 Push to `main` (or run the workflow manually). The workflow:
 1) Builds the vulnerable layer from `layers/vuln-py39/requirements.lock.txt`
 2) Uploads it to `s3://$ARTIFACT_BUCKET/layers/vuln-py39-layer.zip`
-3) Deploys `infra/plerion-badlab.yaml` with `CAPABILITY_NAMED_IAM`
+3) Deploys `plerion-badlab.yaml` with `CAPABILITY_NAMED_IAM`
 
 After deploy, check **CloudFormation → Stacks → plerion-badlab → Outputs** for endpoints and demo creds.
 

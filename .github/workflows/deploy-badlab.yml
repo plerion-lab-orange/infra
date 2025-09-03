@@ -1,16 +1,12 @@
 name: Build & Deploy BadLab
-on: workflow_dispatch
+on:
+  workflow_dispatch: {}
+  push:
+    branches: ["main"]
 
 permissions:
   id-token: write
   contents: read
-
-env:
-  AWS_REGION:           ${{ vars.AWS_REGION }}
-  AWS_ROLE_TO_ASSUME:   ${{ vars.AWS_ROLE_TO_ASSUME }}
-  ARTIFACT_BUCKET:      ${{ vars.ARTIFACT_BUCKET }}
-  STACK_NAME:           ${{ vars.STACK_NAME }}
-  PUBLIC_BUCKET_NAME:   ${{ vars.PUBLIC_BUCKET_NAME }}
 
 jobs:
   build-deploy:
@@ -31,66 +27,20 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
 
-      - name: Show repo tree
-        run: |
-          find . -maxdepth 3 -type f | sort
-
-      # -------- Build vulnerable LAYER only (no function zip) --------
-      - name: Build vulnerable layer (py39)
-        run: |
-          set -euo pipefail
-          docker build -t badlab-py39 layers/vuln-py39
-          mkdir -p layers/vuln-py39/build
-
-          docker run --rm \
-            --entrypoint /bin/bash \
-            -v "$PWD":/work \
-            -w /opt \
-            badlab-py39 -lc '
-              set -euo pipefail
-              cp /work/layers/vuln-py39/requirements.lock.txt /opt/requirements.lock.txt
-              python3 -m pip install --upgrade pip
-              pip install --no-cache-dir -r /opt/requirements.lock.txt -t /opt/python
-              zip -r /opt/vuln-py39-layer.zip python >/dev/null
-              cp /opt/vuln-py39-layer.zip /work/layers/vuln-py39/build/vuln-py39-layer.zip
-            '
-
-      - name: Upload layer to S3 (capture VersionId)
-        id: upload_layer
-        run: |
-          set -euo pipefail
-          LAYER_KEY="layers/vuln-py39-layer.zip"
-          aws s3api put-object \
-            --bucket "${ARTIFACT_BUCKET}" \
-            --key "${LAYER_KEY}" \
-            --body "layers/vuln-py39/build/vuln-py39-layer.zip" \
-            >/tmp/put-layer.json
-
-          LAYER_VERSION_ID=$(aws s3api head-object \
-            --bucket "${ARTIFACT_BUCKET}" \
-            --key "${LAYER_KEY}" \
-            --query VersionId --output text || true)
-
-          echo "LAYER_S3_KEY=${LAYER_KEY}"       | tee -a "$GITHUB_ENV"
-          echo "LAYER_VERSION_ID=${LAYER_VERSION_ID}" | tee -a "$GITHUB_ENV"
-
       - name: Deploy CloudFormation
         run: |
           set -euo pipefail
           aws cloudformation deploy \
-            --stack-name "${STACK_NAME}" \
-            --template-file infra/plerion-badlab.yaml \
+            --stack-name "pd-infra" \
+            --template-file plerion-badlab.yaml \
             --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
             --parameter-overrides \
-              PublicBucketName="${PUBLIC_BUCKET_NAME}" \
-              ArtifactBucket="${ARTIFACT_BUCKET}" \
-              VulnLayerKey="${LAYER_S3_KEY}" \
               LambdaRuntime="python3.9" \
             --no-fail-on-empty-changeset
 
       - name: Show outputs
         run: |
           aws cloudformation describe-stacks \
-            --stack-name "${STACK_NAME}" \
+            --stack-name "pd-infra" \
             --query "Stacks[0].Outputs" \
             --output table

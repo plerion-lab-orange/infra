@@ -11,9 +11,6 @@ Description: >
   - Vulnerable packages via Lambda Layer (built from lock file)
 
 Parameters:
-  PublicBucketName:
-    Type: String
-    Description: Globally-unique S3 bucket name.
   DBMasterUsername:
     Type: String
     Default: badlabuser
@@ -29,13 +26,6 @@ Parameters:
   ApiStageName:
     Type: String
     Default: prod
-  ArtifactBucket:
-    Type: String
-    Description: S3 bucket holding the Lambda layer zip.
-  VulnLayerKey:
-    Type: String
-    Default: layers/vuln-py39-layer.zip
-    Description: S3 key for the vulnerable Python layer zip.
 
 Resources:
 
@@ -182,7 +172,6 @@ Resources:
   PublicBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref PublicBucketName
       PublicAccessBlockConfiguration:
         BlockPublicAcls: false
         BlockPublicPolicy: false
@@ -246,16 +235,6 @@ Resources:
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
                 Resource: "*"
 
-  VulnPy39Layer:
-    Type: AWS::Lambda::LayerVersion
-    Properties:
-      LayerName: plerion-badlab-vuln-py39
-      Content:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Ref VulnLayerKey
-      CompatibleRuntimes: [python3.9]
-      Description: "Intentionally vulnerable Python packages (FOR LAB ONLY)"
-
   BadLambda:
     Type: AWS::Lambda::Function
     Properties:
@@ -264,7 +243,6 @@ Resources:
       Handler: index.handler
       Role: !GetAtt LambdaAdminRole.Arn
       Timeout: 10
-      Layers: [!Ref VulnPy39Layer]
       Environment:
         Variables:
           STRIPE_SECRET_KEY: "sk_live_9r2yYFJk0xQv6D1a7cW8eM5n3pB4tH2L"
@@ -524,7 +502,7 @@ Resources:
 
 Outputs:
   PublicBucketNameOut:
-    Value: !Ref PublicBucketName
+    Value: !Ref PublicBucket
   RDSAddress:
     Value: !GetAtt BadLabRDS.Endpoint.Address
   BadLambdaRuntime:

@@ -1,27 +1,38 @@
 # Plerion BadLab (Auto-deploy)
 
-This repo builds a Lambda **layer** with intentionally vulnerable packages from a **lock file**
-and auto-deploys a CloudFormation stack on every push to `main`.
+Insecure-by-design lab that auto-deploys a CloudFormation stack on each push to `main`.
 
-## One-time AWS setup
-1. Create an S3 artifact bucket (same region as the stack, e.g., `ap-southeast-2`).
-2. Create the GitHub OIDC provider in IAM (`token.actions.githubusercontent.com`).
-3. Create role `GitHubActionsBadlabDeployer` trusted by that provider, attach `AdministratorAccess`.
+## What it provisions (intentionally bad)
+- Public VPC resources and wide-open security groups
+- RDS PostgreSQL exposed publicly with both good and bad SGs
+- Public S3 website bucket with permissive bucket policy
+- SQS queue with an allow-all resource policy
+- Lambda with older runtime, admin role, env/code “secrets,” and public Function URL
+- API Gateway with public and custom-authorized routes
+- IAM anti-patterns (admin roles, wide policies, users with access keys)
+- Publicly readable Secrets Manager secret
 
-## GitHub Actions → Variables (not secrets)
-- `AWS_REGION` = `ap-southeast-2`
-- `AWS_ROLE_TO_ASSUME` = `arn:aws:iam::<ACCOUNT_ID>:role/GitHubActionsBadlabDeployer`
-- `ARTIFACT_BUCKET` = your artifact bucket name
-- `STACK_NAME` = `plerion-badlab`
-- `PUBLIC_BUCKET_NAME` = a globally-unique S3 name you’ll keep stable
+See `plerion-badlab.yaml` for the exact resources.
+
+## CI/CD
+- Workflow: `.github/workflows/deploy-badlab.yml`
+- Triggers: push to `main` or manual run
+- AWS auth: uses static credentials from GitHub Secrets
+- Region: `ap-southeast-2`
+- Stack name: `pd-infra`
 
 ## Deploy
-Push to `main` (or run the workflow manually). The workflow:
-1) Builds the vulnerable layer from `layers/vuln-py39/requirements.lock.txt`
-2) Uploads it to `s3://$ARTIFACT_BUCKET/layers/vuln-py39-layer.zip`
-3) Deploys `plerion-badlab.yaml` with `CAPABILITY_NAMED_IAM`
+Push to `main` or run the workflow manually. It deploys `plerion-badlab.yaml` with required IAM capabilities.
 
-After deploy, check **CloudFormation → Stacks → plerion-badlab → Outputs** for endpoints and demo creds.
+## Using the demo
+- CloudFormation outputs include:
+  - Public S3 bucket name
+  - Lambda Function URL
+  - API endpoints: `/public` and `/secure`
+  - IAM access keys for demo users and a break-glass user
+  - Escalation admin role ARN
+- API Gateway quick check:
+  - Public: GET `.../prod/public`
+  - Secure: GET `.../prod/secure` with header `Authorization: allow` to succeed (anything else is denied)
 
-### Clean up
-Delete the stack. If the public S3 bucket prevents deletion, empty it first.
+Note: This environment is intentionally insecure. Do not reuse in production.

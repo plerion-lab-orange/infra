@@ -155,7 +155,7 @@ Resources:
       DBName: badlab
       Engine: postgres
       EngineVersion: '15'
-      PubliclyAccessible: true
+      PubliclyAccessible: false
       MasterUsername: !Ref DBMasterUsername
       MasterUserPassword: !Ref DBMasterPassword
       AllocatedStorage: 20
